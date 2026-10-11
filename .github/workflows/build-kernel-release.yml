@@ -1062,7 +1062,7 @@ jobs:
 
           ## 📦 Built Devices (${#device_info[@]} total)
 
-          **Feature key:** 🐦 HMBIRD · 🫥 NoMount · 🚀 BBR · 🛡️ BBG · 🌐 TTL · 🧱 IP_SET & IPv6 NAT · 🔧 Unicode Fix · 💻 Droidspaces · 🔃 NTSync
+          **Feature key:** 🐦 HMBIRD · 🫥 NoMount · 🚀 BBR · 🌀 BoRE · ⚡ LZ4 NEON · 🛡️ BBG · 🌐 TTL · 🧱 IP_SET & IPv6 NAT · 🔧 Unicode Fix · 💻 Droidspaces · 🔃 NTSync
 
           > 6.12 kernels ship a leaner set (no BBG/Droidspaces/NTSync); SM8750/MT6991 devices add HMBIRD.
 
@@ -1083,7 +1083,7 @@ jobs:
             feature_flags=$(jq -r --arg MODEL "$model" --arg ORIG_MODEL "$possible_orig_model" --arg OS "$os_ver" '
               ([ .[] | select(.model == $ORIG_MODEL and .os_version == $OS) ][0]) //
               ([ .[] | select(.model == $MODEL      and .os_version == $OS) ][0]) |
-              "\(.hmbird // false)\t\(.NMS // false)\t\(.bbr // false)\t\(.bbr3 // false)\t\(.bbg // false)\t\(.ttl // false)\t\(.ip_set // false)\t\(.unicode // false)\t\(.ds // false)\t\(.ntsync // false)"
+              "\(.hmbird // false)\t\(.NMS // false)\t\(.bbr // false)\t\(.bbr3 // false)\t\(.bore // false)\t\(.lz4_upgrade // false)\t\(.bbg // false)\t\(.ttl // false)\t\(.ip_set // false)\t\(.unicode // false)\t\(.ds // false)\t\(.ntsync // false)"
             ' <<< "$JSON_BUILD_DATA")
             
             features=()
@@ -1091,11 +1091,13 @@ jobs:
               echo "Warning: No JSON entry found for model: $model" >&2
               features_str="N/A"
             else
-              IFS=$'\t' read -r hmbird nms bbr bbr3 bbg ttl ip_set unicode ds ntsync <<< "$feature_flags"
+              IFS=$'\t' read -r hmbird nms bbr bbr3 bore lz4_upgrade bbg ttl ip_set unicode ds ntsync <<< "$feature_flags"
               
               [[ "$hmbird" == "true" ]] && features+=("🐦 HMBIRD")
               [[ "$nms" == "true" ]] && features+=("🫥 NoMount")
               { [[ "$bbr" == "true" ]] || [[ "$bbr3" == "true" ]]; } && features+=("🚀 BBR")
+              [[ "$bore" == "true" ]] && features+=("🌀 BoRE")
+              [[ "$lz4_upgrade" == "true" ]] && features+=("⚡ LZ4 NEON")
               [[ "$bbg" == "true" ]] && features+=("🛡️ BBG")
               [[ "$ttl" == "true" ]] && features+=("🌐 TTL")
               [[ "$ip_set" == "true" ]] && features+=("🧱 IP_SET & IPv6 NAT")

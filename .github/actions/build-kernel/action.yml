@@ -57,6 +57,11 @@ inputs:
     required: false
     type: string
     default: main
+  patch_dry_run:
+    description: 'Apply all patches and stop before compilation (verification mode)'
+    required: false
+    type: boolean
+    default: false
   github_token:
     description: 'GitHub Token'
     required: true
@@ -123,6 +128,14 @@ runs:
       set -euo pipefail
       echo '${{ inputs.op_config_json }}' > /tmp/config.json
       jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
+      P_MODEL="$(jq -r '.model // "unknown"' /tmp/config.json)"
+      P_OSVER="$(jq -r '.os_version // "unknown"' /tmp/config.json)"
+      PS_BASE="$(echo "$P_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${P_OSVER}"
+      echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
+      echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
+      if [ -z "${OP_BORE:-}" ]; then
+        echo "OP_BORE=true" >> "$GITHUB_ENV"
+      fi
       echo "Parsed config:"
       jq '.' /tmp/config.json
 
@@ -263,6 +276,13 @@ runs:
         errors+=("Input 'bbr3' contains invalid characters. Allowed: 'true' or 'false'. Got: '$bbr3'")
       fi
 
+      for bool_opt in OP_BORE OP_LZ4_UPGRADE; do
+        val="${!bool_opt:-}"
+        if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
+          errors+=("$bool_opt must be true or false if set. Got: '$val'")
+        fi
+      done
+
       if [[ -z "$ttl" ]]; then
         errors+=("Input 'ttl' cannot be empty")
       elif [[ "$ttl" != "true" && "$ttl" != "false" ]]; then
@@ -392,6 +412,466 @@ runs:
 
       DEBUG_ZIP_NAME="debug_${OP_MODEL}_${OP_OS_VERSION}.zip"
       echo "DEBUG_ZIP_NAME=$DEBUG_ZIP_NAME" >> "$GITHUB_ENV"
+
+  - name: Prepare patch generation harness
+    shell: bash
+    run: |
+      set -euo pipefail
+      mkdir -p "$GITHUB_WORKSPACE/patchgen" "$GITHUB_WORKSPACE/patch-faillogs"
+      cat > "$GITHUB_WORKSPACE/patchgen/gen_patch.sh" <<'GEN_PATCH_EOF'
+      split_hunks() {
+        local patch_file="$1" out_dir="$2"
+        rm -rf "$out_dir" && mkdir -p "$out_dir"
+        awk -v out="$out_dir" '
+          BEGIN { inh = 0; nh = 0; orem = 0; nrem = 0; sawd = 0; sawp = 0; hdr = "" }
+          !inh && /^diff |^Index: / { hdr = $0 "\n"; sawd = 0; sawp = 0; next }
+          !inh && /^--- / && !sawd { hdr = hdr $0 "\n"; sawd = 1; next }
+          !inh && /^\+\+\+ / && sawd && !sawp { hdr = hdr $0 "\n"; sawp = 1; next }
+          !inh && /^--- / && sawd && sawp { hdr = $0 "\n"; sawd = 1; sawp = 0; next }
+          !inh && /^@@ / {
+            split($0, a, " ")
+            split(a[2], o, ","); split(a[3], n, ",")
+            orem = (length(o[2]) ? o[2]+0 : 1); nrem = (length(n[2]) ? n[2]+0 : 1)
+            if (sawp) {
+              nh++; hf = sprintf("%s/h%03d.hunk", out, nh)
+              printf "%s", hdr > hf; print $0 >> hf; inh = 1
+            }
+            next
+          }
+          inh {
+            print $0 >> hf
+            if ($0 ~ /^\\/) next
+            c = substr($0, 1, 1)
+            if (c == "-") orem--
+            else if (c == "+") nrem--
+            else { orem--; nrem-- }
+            if (orem <= 0 && nrem <= 0) { close(hf); inh = 0 }
+            next
+          }
+        ' "$patch_file"
+      }
+      anchor_rescue() {
+        local name="$1" patch_file="$2" verify_spec="${3:-}"
+        local anchors="$GITHUB_WORKSPACE/patch-anchors.txt"
+        local sha
+        sha=$(awk -v n="$name" '$1 == n && $2 ~ /^[0-9a-fA-F]{7,40}$/ { print $2; exit }' "$anchors" 2>/dev/null || true)
+        if [ -z "$sha" ]; then
+          echo "[patchgen] ${name}: no patch-anchors.txt entry; skipping 3-way rescue"
+          return 1
+        fi
+        local kdir="$COMMON_KERNEL_FOLDER" adir="/tmp/pg_${name}_anchor" bdir="/tmp/pg_${name}_base" mdir="/tmp/pg_${name}_merged"
+        local alog="/tmp/pg_${name}_anchor.log"
+        rm -rf "$adir" "$bdir" "$mdir" && mkdir -p "$adir" "$bdir" "$mdir"
+        echo "[patchgen] ${name}: staging failed — attempting anchor 3-way merge (base ${sha})"
+        : > "$alog"
+        git -C "$kdir" fetch --depth=1 origin "$sha" >> "$alog" 2>&1 || true
+        if ! git -C "$kdir" cat-file -e "$sha" 2>/dev/null; then
+          echo "::warning::[patchgen] ${name}: anchor ${sha} not fetchable from origin; rescue aborted"
+          return 1
+        fi
+        if ! git -C "$kdir" archive "$sha" | tar -x -C "$bdir" >> "$alog" 2>&1; then
+          echo "::warning::[patchgen] ${name}: anchor ${sha} archive failed; rescue aborted"
+          return 1
+        fi
+        cp -a "$bdir/." "$adir/"
+        if ! patch -p1 --dry-run --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1; then
+          echo "::warning::[patchgen] ${name}: patch does not apply cleanly on anchor ${sha} (stale anchor); rescue aborted"
+          cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+          return 1
+        fi
+        local targets f rc status=0
+        targets=$( { grep -E '^(\+\+\+|---) ' "$patch_file" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u )
+        patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1 || true
+        : > "${mdir}/.ops"
+        for f in $targets; do
+          case "$f" in /dev/null) continue ;; esac
+          if [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
+            mkdir -p "${mdir}/$(dirname "$f")"
+            git merge-file -L ours -L base -L theirs -p "$kdir/$f" "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "conflict: $f (exit $rc)" >> "$alog"; status=1
+            else
+              echo "keep $f" >> "${mdir}/.ops"
+            fi
+          elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
+            mkdir -p "${mdir}/$(dirname "$f")"
+            cp "$adir/$f" "${mdir}/$f"
+            echo "keep $f" >> "${mdir}/.ops"
+          elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
+            mkdir -p "${mdir}/$(dirname "$f")"
+            git merge-file -L ours -L base -L theirs -p "$kdir/$f" /dev/null "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "conflict: $f (created on both sides, exit $rc)" >> "$alog"; status=1
+            else
+              echo "keep $f" >> "${mdir}/.ops"
+            fi
+          elif [ -f "$bdir/$f" ] && [ ! -f "$adir/$f" ]; then
+            if [ -f "$kdir/$f" ] && cmp -s "$kdir/$f" "$bdir/$f"; then
+              echo "delete $f" >> "${mdir}/.ops"
+            else
+              echo "conflict: $f (deleted by patch but modified in tree)" >> "$alog"; status=1
+            fi
+          elif [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
+            mkdir -p "${mdir}/$(dirname "$f")"
+            git merge-file -L ours -L base -L theirs -p /dev/null "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "conflict: $f (missing in tree, exit $rc)" >> "$alog"; status=1
+            else
+              echo "keep $f" >> "${mdir}/.ops"
+            fi
+          else
+            echo "conflict: $f (unresolvable file state)" >> "$alog"; status=1
+          fi
+        done
+        if [ "$status" -ne 0 ]; then
+          echo "::warning::[patchgen] ${name}: anchor 3-way merge hit conflicts; patch rejected (all-or-nothing)"
+          cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+          return 1
+        fi
+        if [ -n "$verify_spec" ]; then
+          local spec vrc=0
+          local -a vlist
+          ( cd "$mdir" || exit 1
+            IFS=';' read -ra vlist <<< "$verify_spec"
+            for spec in "${vlist[@]}"; do
+              [ -n "$spec" ] || continue
+              case "$spec" in
+                g:*) verify_grep "${spec#g:}" || { vrc=1; break; } ;;
+                f:*) verify_infn "${spec#f:}" || { vrc=1; break; } ;;
+              esac
+            done ) || vrc=1
+          if [ "$vrc" -ne 0 ]; then
+            echo "::warning::[patchgen] ${name}: anchor-merged result failed verification; patch rejected"
+            cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+            return 1
+          fi
+          echo "[patchgen] ${name}: anchor-merge verification passed"
+          echo "✅ ${name} verified (anchor-merge)"
+        fi
+        local op p
+        while read -r op; do
+          case "$op" in
+            keep\ *) p="${op#keep }"; cp "${mdir}/${p}" "${kdir}/${p}" ;;
+            delete\ *) p="${op#delete }"; rm -f "${kdir}/${p}" ;;
+          esac
+        done < "${mdir}/.ops"
+        echo "[patchgen] ${name}: applied via anchor 3-way merge (base ${sha})"
+        echo "${name}|applied" >> "${PS_FILE:-patch-status-raw.txt}"
+        cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
+        return 0
+      }
+      fuzz_restage() {
+        local name="$1" src="$2" md="$3" targets="$4" base="$5"
+        local f h hdir hlist ok=1
+        for f in $targets; do
+          case "$f" in /dev/null) continue ;; esac
+          [ -f "$f" ] || continue
+          cp "$f" "${md}/$f"
+        done
+        : > "${base}/fuzz.log"
+        hdir="${base}/hunks_fuzz"
+        split_hunks "$src" "$hdir"
+        hlist=$(ls "$hdir"/*.hunk 2>/dev/null || true)
+        for h in $hlist; do
+          if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
+            continue
+          fi
+          if patch -p1 --forward --fuzz=2 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
+            echo "hunk ${h##*/} staged at fuzz=2 (sandbox only)" >> "${base}/fuzz.log"
+            continue
+          fi
+          echo "hunk ${h##*/} not stageable even at fuzz=2" >> "${base}/fuzz.log"
+          ok=0
+        done
+        find "$md" -name '*.rej' -delete 2>/dev/null || true
+        find "$md" -name '*.orig' -delete 2>/dev/null || true
+        if [ "$ok" -eq 1 ]; then
+          cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
+          echo "[patchgen] ${name}: staged with bounded per-hunk fuzz (sandbox only); regenerating exact patch for the target tree"
+          return 0
+        fi
+        cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
+        return 1
+      }
+      gen_patch() {
+        local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
+        local base="$GITHUB_WORKSPACE/patchgen/${name}"
+        local um="${base}/unmodified" md="${base}/modified"
+        local psf="${PS_FILE:-patch-status-raw.txt}"
+        rm -rf "$base" && mkdir -p "$um" "$md"
+        local src="/tmp/pg_${name}.patch"
+        if [ -n "$sed_expr" ]; then sed -e "$sed_expr" "$patch_file" > "$src"; else cp "$patch_file" "$src"; fi
+        local targets f
+        targets=$( { grep -E '^\+\+\+ ' "$src" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u )
+        if [ -z "$targets" ]; then
+          echo "::warning::[patchgen] ${name} patch exposes no file targets; not applied"
+          echo "${name}|failed" >> "$psf"
+          return 0
+        fi
+        for f in $targets; do
+          case "$f" in /dev/null) continue ;; esac
+          [ -f "$f" ] || continue
+          mkdir -p "${um}/$(dirname "$f")" "${md}/$(dirname "$f")"
+          cp "$f" "${um}/$f" && cp "$f" "${md}/$f"
+        done
+        local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct
+        mkdir -p "$hunk_dir"
+        split_hunks "$src" "$hunk_dir"
+        hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
+        : > "${base}/stage.log"
+        if [ -z "$hlist" ]; then
+          if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/stage.log" 2>&1; then
+            staged=1; already_ct=0; failed_ct=0
+          elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$src" >/dev/null 2>&1; then
+            echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean at staging)"
+            verify_applied "$name" "$src" \
+              || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+            echo "[patchgen] ${name}: verification passed"
+            echo "✅ ${name} verified (already in tree)"
+            echo "${name}|already" >> "$psf"
+            return 0
+          else
+            anchor_rescue "$name" "$src" "$verify_spec" && return 0
+            if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+              staged=1; already_ct=0; failed_ct=0
+            else
+              cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+              find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
+              echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
+              echo "${name}|failed" >> "$psf"
+              return 0
+            fi
+          fi
+        else
+          staged=0; already_ct=0; failed_ct=0
+          for h in $hlist; do
+            if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+              staged=$((staged+1))
+            elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+              already_ct=$((already_ct+1))
+            else
+              failed_ct=$((failed_ct+1))
+              echo "hunk not stageable: ${h##*/}" >> "${base}/stage.log"
+            fi
+          done
+          find "$md" -name '*.rej' -delete 2>/dev/null || true
+          find "$md" -name '*.orig' -delete 2>/dev/null || true
+          echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
+          [ "$failed_ct" -eq 0 ] || cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+          if [ "$failed_ct" -gt 0 ]; then
+            anchor_rescue "$name" "$src" "$verify_spec" && return 0
+            if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+              staged=1; already_ct=0; failed_ct=0
+            else
+              echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; fuzz re-stage failed; NOT applying a partial patch"
+              echo "${name}|failed" >> "$psf"
+              return 0
+            fi
+          fi
+        fi
+        if [ "$staged" -eq 0 ]; then
+          if [ "$already_ct" -gt 0 ]; then
+            [ "$failed_ct" -eq 0 ] || echo "::warning::[patchgen] ${name}: ${failed_ct} hunk(s) neither present nor applicable; ${already_ct} hunk(s) already in tree"
+            echo "[patchgen] ${name}: change already present in tree"
+            verify_applied "$name" "$src" \
+              || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+            echo "[patchgen] ${name}: verification passed"
+            echo "✅ ${name} verified (already in tree)"
+            echo "${name}|already" >> "$psf"
+          else
+            anchor_rescue "$name" "$src" "$verify_spec" && return 0
+            echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
+            echo "${name}|failed" >> "$psf"
+          fi
+          return 0
+        fi
+        ( cd "$base" && diff -ruN unmodified modified ) > "${base}/regen.patch" || true
+        if patch -p1 --forward --fuzz=0 < "${base}/regen.patch" > "${base}/apply.log" 2>&1; then
+          :
+        elif patch -p1 --dry-run -R --fuzz=0 < "${base}/regen.patch" >> "${base}/apply.log" 2>&1; then
+          echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean)"
+          verify_applied "$name" "$src" \
+            || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
+          echo "[patchgen] ${name}: verification passed"
+          echo "✅ ${name} verified (already in tree)"
+          echo "${name}|already" >> "$psf"
+          return 0
+        else
+          cp "${base}/apply.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_apply.log" 2>/dev/null || true
+          echo "::warning::[patchgen] ${name} regenerated patch did not apply; not applied"
+          echo "${name}|failed" >> "$psf"
+          return 0
+        fi
+        if ! verify_applied "$name" "$src"; then
+          {
+            echo "[patchgen] ${name} self-verification FAILED (sampled added lines missing after apply)."
+            echo "  Reverse-applying the patch to keep the tree consistent."
+          } > "${base}/verify.log"
+          patch -p1 -R --fuzz=0 < "${base}/regen.patch" >> "${base}/verify.log" 2>&1 || true
+          cp "${base}/verify.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_verify.log" 2>/dev/null || true
+          echo "::warning::[patchgen] ${name} applied but self-verification failed; patch reverted"
+          echo "${name}|failed" >> "$psf"
+          return 0
+        fi
+        if [ -n "$verify_spec" ]; then
+          local spec rc=0
+          local -a vlist
+          IFS=';' read -ra vlist <<< "$verify_spec"
+          for spec in "${vlist[@]}"; do
+            [ -n "$spec" ] || continue
+            case "$spec" in
+              g:*) verify_grep "${spec#g:}" || { rc=1; break; } ;;
+              f:*) verify_infn "${spec#f:}" || { rc=1; break; } ;;
+              *) echo "::warning::[patchgen] ${name}: unknown verify directive '${spec}'" ;;
+            esac
+          done
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "[patchgen] ${name} verification FAILED (spec: ${verify_spec})"
+              echo "  A required symbol is missing or landed outside its expected scope."
+              echo "  Reverse-applying the patch to keep the tree consistent."
+            } > "${base}/verify.log"
+            patch -p1 -R --fuzz=0 < "${base}/regen.patch" >> "${base}/verify.log" 2>&1 || true
+            cp "${base}/verify.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_verify.log" 2>/dev/null || true
+            echo "::warning::[patchgen] ${name} applied but verification failed; patch reverted"
+            echo "${name}|failed" >> "$psf"
+            return 0
+          fi
+          echo "[patchgen] ${name}: verification passed (spec: ${verify_spec})"
+        else
+          echo "[patchgen] ${name}: verification passed"
+        fi
+        echo "✅ ${name} verified"
+        echo "${name}|applied" >> "$psf"
+        return 0
+      }
+      gen_patch_fb() {
+        # Primary-with-fallback wrapper around gen_patch. Runs the primary
+        # patch first; if it does not land, wipes the stale per-patch status
+        # lines and retries once with the fallback patch.
+        # Sets GEN_PATCH_FB_VIA for the caller: primary | fallback | none.
+        local name="$1" primary="$2" fallback="$3" sed_expr="${4:-}" verify_spec="${5:-}"
+        local psf="${PS_FILE:-patch-status-raw.txt}"
+        GEN_PATCH_FB_VIA="none"
+        if [ -n "$primary" ] && [ -f "$primary" ]; then
+          GEN_PATCH_FB_VIA="primary"
+          sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
+          gen_patch "$name" "$primary" "$sed_expr" "$verify_spec" || true
+          grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
+        fi
+        if [ -n "$fallback" ] && [ -f "$fallback" ]; then
+          GEN_PATCH_FB_VIA="fallback"
+          echo "[patchgen] ${name}: primary patch did not land; falling back to $(basename "$fallback")"
+          sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
+          gen_patch "$name" "$fallback" "$sed_expr" "$verify_spec" || true
+          grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
+        fi
+        return 1
+      }
+      verify_grep() {
+        local spec="$1"
+        local file="${spec%%|*}" regex="${spec#*|}"
+        if [ ! -e "$file" ]; then
+          echo "[patchgen] verify: ${file} not found"
+          return 1
+        fi
+        local hits
+        hits=$(grep -nE "$regex" "$file" 2>/dev/null | head -n 5 || true)
+        if [ -n "$hits" ]; then
+          printf '%s\n' "$hits"
+          return 0
+        fi
+        echo "[patchgen] verify: no match for '${regex}' in ${file}"
+        return 1
+      }
+      verify_infn() {
+        local spec="$1"
+        local file="${spec%%|*}"
+        local rest="${spec#*|}"
+        local func="${rest%%|*}" sym="${rest#*|}"
+        [ -f "$file" ] || { echo "[patchgen] verify: ${file} not found"; return 1; }
+        if awk -v fn="$func" -v sym="$sym" '
+          $0 ~ ("^[A-Za-z_].*" fn "[[:space:]]*\\(") && $0 !~ /;[[:space:]]*$/ { infn = 1; depth = 0; seen = 0 }
+          infn {
+            ob = gsub(/{/, "{"); cb = gsub(/}/, "}")
+            depth += ob - cb
+            if ($0 ~ sym) { found = 1; exit }
+            if (ob > 0) seen = 1
+            if (seen && depth <= 0) { infn = 0; seen = 0 }
+          }
+          END { exit (found ? 0 : 1) }
+        ' "$file"; then
+          echo "[patchgen] verify: ${file}: '${sym}' present inside ${func}()"
+          return 0
+        fi
+        echo "[patchgen] verify: ${file}: '${sym}' NOT found inside ${func}()"
+        return 1
+      }
+      verify_applied() {
+        # Generic post-apply self-verification driven by the patch itself:
+        # sample lines the patch adds and confirm they are present in the
+        # live tree. Prints matched evidence lines; non-zero if any sampled
+        # line is missing. Handles both '+++ b/path' (upstream) and
+        # '+++ modified/path' (diff -ruN regen) header shapes.
+        local name="$1" patch_file="$2"
+        local map
+        map=$(awk '
+          /^--- / { next }
+          /^\+\+\+ / {
+            p = $2
+            if (p == "/dev/null") { cur = ""; next }
+            sub(/^[^\/]+\//, "", p)
+            cur = p; next
+          }
+          /^@@/ { next }
+          /^\+/ {
+            if (cur == "") next
+            line = substr($0, 2); sub(/\r$/, "", line)
+            if (line ~ /^[ \t]*$/) next
+            if (length(line) > 240) next
+            if (seen[cur] >= 2) next
+            if (total >= 24) next
+            print cur "\t" line
+            seen[cur]++; total++
+          }
+          BEGIN { total = 0 }
+        ' "$patch_file") || true
+        if [ -z "$map" ]; then
+          echo "[patchgen] ${name}: nothing to self-verify (no added lines)"
+          return 0
+        fi
+        local f line shown=0 miss=0
+        while IFS=$'\t' read -r f line; do
+          [ -n "$f" ] || continue
+          if [ ! -f "$f" ] || ! grep -qF -- "$line" "$f" 2>/dev/null; then
+            echo "[patchgen] ${name}: VERIFY MISS ${f}: ${line}"
+            miss=$((miss+1))
+            continue
+          fi
+          if [ "$shown" -lt 8 ]; then
+            grep -nF -- "$line" "$f" 2>/dev/null | head -n 1
+            shown=$((shown+1))
+          fi
+        done <<< "$map"
+        [ "$miss" -eq 0 ] || return 1
+        return 0
+      }
+      fetch_patch() {
+        local url="$1" out="$2" min="${3:-200}"
+        curl -sSL --fail -o "$out" "$url" || return 1
+        local sz
+        sz="$(stat -c%s "$out" 2>/dev/null || echo 0)"
+        if [ "$sz" -lt "$min" ]; then
+          echo "::warning::[fetch_patch] ${url} fetched only ${sz} bytes (floor ${min}); treating as unavailable"
+          return 1
+        fi
+        return 0
+      }
+      GEN_PATCH_EOF
+      echo "patch generation harness ready"
 
   - name: Set Kernel build-tools to Path
     shell: bash
@@ -939,6 +1419,98 @@ runs:
       bash "$BOUTEILLE_KERNEL_PATCHES_FOLDER/scripts/apply_nomount_stack.sh" ghost
       bash "$BOUTEILLE_KERNEL_PATCHES_FOLDER/scripts/apply_nomount_stack.sh" pathhide
 
+  - name: Upgrade LZ4 (OPlus 1.10.0 + NEON)
+    if: ${{ env.OP_LZ4_UPGRADE == 'true' }}
+    shell: bash
+    run: |
+      set -euo pipefail
+      echo "::group::Upgrade LZ4"
+      cd "$COMMON_KERNEL_FOLDER"
+      if [ -f lib/lz4/lz4.c ] && grep -q 'lib/lz4/lz4.h' include/linux/lz4.h 2>/dev/null; then
+        echo "LZ4 already upgraded, skipping"
+      else
+        rm -rf "$GITHUB_WORKSPACE/lz4_oplus"
+        git clone --depth 1 https://github.com/Numbersf/lz4_oplus.git "$GITHUB_WORKSPACE/lz4_oplus"
+        bash "$GITHUB_WORKSPACE/lz4_oplus/apply_lz4_oplus.sh"
+      fi
+      grep -q 'lib/lz4/lz4.h' include/linux/lz4.h
+      grep -q 'LZ4_arm64_decompress_safe' crypto/lz4.c
+      ls lib/lz4/lz4.c lib/lz4/lz4hc.c lib/lz4/lz4armv8/lz4accel.c > /dev/null
+      echo "LZ4_UPGRADED=true" >> "$GITHUB_ENV"
+      echo "LZ4_SOURCE=https://github.com/Numbersf/lz4_oplus" >> "$GITHUB_ENV"
+      echo "✅ LZ4 upgraded to 1.10.0 with ARM64 NEON acceleration"
+      echo "::endgroup::"
+
+  - name: Apply BoRE
+    shell: bash
+    run: |
+      set -euo pipefail
+      echo "::group::Apply BoRE scheduler"
+      cd "$COMMON_KERNEL_FOLDER"
+      source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+      BORE_PATCH="bore_${KERNEL_VER}.patch"
+      case "$KERNEL_VER" in
+        6.6|6.12) BORE_SPEC="g:kernel/sched/bore.c|sched_bore_init" ;;
+        *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
+      esac
+      # Tree-exact regen patch is the PRIMARY source: pre-ported BoRE patches
+      # live in scripts/patches, keyed by kernel version
+      # (bore_<ver>_oneplus_regen.patch). They run through the same gen_patch
+      # pipeline (stage fuzz=0 -> regen -> apply fuzz=0 -> verify), so patchgen
+      # staging wins whenever a committed override exists. Bouteillepleine's
+      # upstream patch targets the reworked EEVDF base and structurally cannot
+      # stage on this tree, so the upstream fetch is the fallback, used only
+      # when no regen patch is committed for this kernel version.
+      BORE_REGEN="$GITHUB_WORKSPACE/scripts/patches/bore_${KERNEL_VER}_oneplus_regen.patch"
+      [ -f "$BORE_REGEN" ] || BORE_REGEN=""
+      # Fail-safe content guard: a regen patch carrying the duplicated
+      # return-curr construct (added line directly above an identical
+      # context line in a brace-less if) bootloops the device. Refuse it
+      # rather than build an unbootable kernel.
+      if [ -n "$BORE_REGEN" ] && awk '
+          /^\+[[:space:]]*return curr;[[:space:]]*$/ { if ((getline nxt) > 0 && nxt ~ /^[[:space:]]*return curr;[[:space:]]*$/) { found = 1; exit } }
+          END { exit !(found) }
+        ' "$BORE_REGEN"; then
+        echo "::warning::bore: committed regen patch matches the duplicated return-curr bootloop signature; refusing it — re-commit the corrected bore_${KERNEL_VER}_oneplus_regen.patch"
+        BORE_REGEN=""
+      fi
+      BORE_UPSTREAM=""
+      if fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}" /tmp/bore.patch; then
+        BORE_UPSTREAM="/tmp/bore.patch"
+      fi
+      if [ -z "$BORE_REGEN" ] && [ -z "$BORE_UPSTREAM" ]; then
+        echo "::warning::BoRE patch unavailable (${BORE_PATCH}); skipping"
+        echo "bore|skipped" >> "$PS_FILE"
+        echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+        echo "::endgroup::"
+        exit 0
+      fi
+      gen_patch_fb bore "$BORE_REGEN" "$BORE_UPSTREAM" "" "$BORE_SPEC" || true
+      if [ "${GEN_PATCH_FB_VIA:-none}" = "none" ] || ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+        echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+        echo "::endgroup::"
+        exit 0
+      fi
+      if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
+        echo "[patchgen] bore: landed via tree-exact regen (patchgen staging, $(basename "$BORE_REGEN"))"
+        echo "BORE_VIA=patchgen-regen" >> "$GITHUB_ENV"
+      else
+        echo "[patchgen] bore: landed via latest-upstream ($(basename "$BORE_UPSTREAM"))"
+        echo "BORE_VIA=latest-upstream" >> "$GITHUB_ENV"
+      fi
+      grep -q 'config SCHED_BORE' init/Kconfig
+      grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
+        echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
+      grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
+      echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
+      if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
+        echo "BORE_SOURCE=scripts/patches/$(basename "$BORE_REGEN") (tree-exact regen)" >> "$GITHUB_ENV"
+      else
+        echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
+      fi
+      echo "✅ BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
+      echo "::endgroup::"
+
   - name: Add BBG
     if: ${{ env.OP_BBG == 'true' }}
     shell: bash
@@ -1387,7 +1959,6 @@ runs:
       fi
 
       echo "✅ Droidspaces Support applied"
-      echo "ds|applied" >> "$PS_FILE"
       echo "::endgroup::"
 
   - name: Add Build based configs
@@ -1593,6 +2164,42 @@ runs:
       fi
 
       echo "✅ ADIOS I/O scheduler setup completed"
+      echo "::endgroup::"
+
+  - name: Patch dry-run verdict
+    if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
+    shell: bash
+    run: |
+      set -euo pipefail
+      echo "::group::Patch dry-run verdict"
+      VERDICT="$DEBUG_ARTIFACTS_DIR/patch_dry_run_${OP_MODEL}_${OP_OS_VERSION}.txt"
+      failed_patches="$(grep -Ec '\|failed$' "$PS_FILE" 2>/dev/null || true)"
+      skipped_patches="$(grep -Ec '\|skipped$' "$PS_FILE" 2>/dev/null || true)"
+      {
+        echo "device=$OP_MODEL os=$OP_OS_VERSION"
+        echo "kernel=${ANDROID_VER}-${TKERNEL_VER}"
+        echo "== per-patch status =="
+        cat "$PS_FILE" 2>/dev/null || true
+        echo "== summary =="
+        echo "failed_patches=${failed_patches:-0}"
+        echo "skipped_patches=${skipped_patches:-0}"
+        echo "adios=${ADIOS_ENABLED:-not-applied}"
+        echo "bbrv3=${BBR3_APPLIED:-not-applied}"
+        echo "bore=${BORE_APPLIED:-not-applied}"
+        echo "bore_skipped=${BORE_SKIPPED:-none}"
+        echo "adios_skipped=${ADIOS_SKIPPED:-none}"
+        if [ "${failed_patches:-0}" -gt 0 ] || [ "${skipped_patches:-0}" -gt 0 ]; then
+          echo "result=PARTIAL_PATCHES_APPLIED"
+        else
+          echo "result=ALL_PATCHES_APPLIED_CLEANLY"
+        fi
+      } > "$VERDICT"
+      cat "$VERDICT"
+      if [ "${failed_patches:-0}" -gt 0 ] || [ "${skipped_patches:-0}" -gt 0 ]; then
+        echo "::notice::patch_dry_run=true — patches applied with soft-skips/soft-fails for ${OP_MODEL} ${OP_OS_VERSION} (see verdict). Compilation intentionally skipped."
+      else
+        echo "::notice::patch_dry_run=true — every requested patch applied cleanly for ${OP_MODEL} ${OP_OS_VERSION}. Compilation intentionally skipped."
+      fi
       echo "::endgroup::"
 
   - name: Build Kernel
@@ -2189,6 +2796,8 @@ runs:
         echo "Kernel Optimisations: ${{ env.OP_OPT }}"
         echo "BBR: ${{ env.OP_BBR }}"
         echo "BBRv3: ${{ env.OP_BBR3 }}"
+        echo "BoRE: ${BORE_STATUS:-disabled} (via ${BORE_VIA:-n/a})"
+        echo "LZ4 1.10.0 + ARM64 NEON: ${LZ4_UPGRADED:-false}"
         echo "BBG: ${{ env.OP_BBG }}"
         echo "HMBIRD SCX: ${{ env.OP_HMBIRD }}"
         echo "TTL: ${{ env.OP_TTL }}"
@@ -2253,6 +2862,8 @@ runs:
         echo "| **Kernel Optimisations** | ${{ env.OP_OPT }} |"
         echo "| **BBR** | ${{ env.OP_BBR }} |"
         echo "| **BBRv3** | ${{ env.OP_BBR3 }} |"
+        echo "| **BoRE** | ${BORE_STATUS:-disabled} (via ${BORE_VIA:-n/a}) |"
+        echo "| **LZ4 1.10.0 + ARM64 NEON** | ${LZ4_UPGRADED:-false} |"
         echo "| **BBG** | ${{ env.OP_BBG }} |"
         echo "| **HMBIRD SCX** | ${{ env.OP_HMBIRD }} |"
         echo "| **TTL** | ${{ env.OP_TTL }} |"

@@ -20,6 +20,8 @@
   "bbg": true,
   "bbr": true,
   "bbr3": true,
+  "bore": true,
+  "lz4_upgrade": true,
   "ttl": true,
   "ip_set": true,
   "unicode": true,
