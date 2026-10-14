@@ -39,12 +39,12 @@ on:
         description: 'Optional exact/prefix model: OP12, OP13-CPH, OP-NORD-4, OP12-6.1.118. Case-sensitive. Empty = all.'
         required: false
         type: string
-        default: ''
+        default: '0_R11'
       ksu_options:
         description: 'Enter SukiSU build json'
         required: true
         type: string
-        default: '[{"type":"SUKISU","hash":"main"}]'
+        default: '[{"type":"SUKISU","hash":"95226411b36f6d3c2d224c090133ad79db65bfc8"}]'
       optimize_level:
         description: "Compiler optimization level"
         required: true
@@ -63,7 +63,7 @@ on:
       clean_build:
         description: 'Clean build (no ccache)'
         type: boolean
-        default: false
+        default: true
       debug:
         description: 'Enable debug mode: dumping debug related artifacts and show some debug logs'
         required: false
@@ -73,7 +73,7 @@ on:
         description: 'Enable ADIOS I/O scheduler support (5.10/5.15/6.1/6.6/6.12 kernels)'
         required: false
         type: boolean
-        default: false
+        default: true
       susfs_lkm_ref:
         description: 'Branch/tag/SHA of Bouteillepleine/susfs4ksu-lkm to build susfs_guard_lkm.ko from, against the same tree and toolchain as the kernel. Empty = skip. A branch moves, so a release you want to reproduce should pass a tag or SHA.'
         required: false

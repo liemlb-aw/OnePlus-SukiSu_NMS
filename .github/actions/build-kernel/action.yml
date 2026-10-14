@@ -1332,29 +1332,29 @@ runs:
           ;;
       esac
 
-      echo "Patch to fix kernel panic caused by oplus_bsp_midas"
-      patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch"
+      # echo "Patch to fix kernel panic caused by oplus_bsp_midas"
+      # patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch"
 
-      cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
-      CONFIG_SYSVIPC=y
-      CONFIG_DEVTMPFS=y
-      # CONFIG_PID_NS=y
-      CONFIG_POSIX_MQUEUE=y
-      CONFIG_NETFILTER_XT_TARGET_REJECT=y
-      CONFIG_NETFILTER_XT_TARGET_LOG=y
-      CONFIG_NETFILTER_XT_MATCH_RECENT=y
-      # CONFIG_USER_NS=y
-      EOF
+      # cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
+      # CONFIG_SYSVIPC=y
+      # CONFIG_DEVTMPFS=y
+      # # CONFIG_PID_NS=y
+      # CONFIG_POSIX_MQUEUE=y
+      # CONFIG_NETFILTER_XT_TARGET_REJECT=y
+      # CONFIG_NETFILTER_XT_TARGET_LOG=y
+      # CONFIG_NETFILTER_XT_MATCH_RECENT=y
+      # # CONFIG_USER_NS=y
+      # EOF
 
-      if [ "${{ env.OP_RUST_BUILD }}" = "true" ]; then
-        echo "Add IPC NS missing symbols for rust binder"
-        if ! grep -q 'EXPORT_SYMBOL.*put_ipc_ns' "$COMMON_KERNEL_FOLDER/ipc/namespace.c"; then
-          echo -e '\nEXPORT_SYMBOL_GPL(put_ipc_ns);' >> "$COMMON_KERNEL_FOLDER/ipc/namespace.c"
-        fi
-        if ! grep -q 'EXPORT_SYMBOL.*init_ipc_ns' "$COMMON_KERNEL_FOLDER/ipc/msgutil.c"; then
-          echo -e '\nEXPORT_SYMBOL_GPL(init_ipc_ns);' >> "$COMMON_KERNEL_FOLDER/ipc/msgutil.c"
-        fi
-      fi
+      # if [ "${{ env.OP_RUST_BUILD }}" = "true" ]; then
+      #   echo "Add IPC NS missing symbols for rust binder"
+      #   if ! grep -q 'EXPORT_SYMBOL.*put_ipc_ns' "$COMMON_KERNEL_FOLDER/ipc/namespace.c"; then
+      #     echo -e '\nEXPORT_SYMBOL_GPL(put_ipc_ns);' >> "$COMMON_KERNEL_FOLDER/ipc/namespace.c"
+      #   fi
+      #   if ! grep -q 'EXPORT_SYMBOL.*init_ipc_ns' "$COMMON_KERNEL_FOLDER/ipc/msgutil.c"; then
+      #     echo -e '\nEXPORT_SYMBOL_GPL(init_ipc_ns);' >> "$COMMON_KERNEL_FOLDER/ipc/msgutil.c"
+      #   fi
+      # fi
 
       echo "✅ Droidspaces Support applied"
       echo "::endgroup::"
