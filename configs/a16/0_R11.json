@@ -16,7 +16,7 @@
   "hmbird": false,
   "NMS": true,
   "opt": false,
-  "ds": false,
+  "ds": true,
   "bbg": false,
   "bbr": true,
   "bbr3": true,
