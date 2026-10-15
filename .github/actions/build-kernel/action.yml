@@ -866,9 +866,17 @@ runs:
         echo "Injected KSU externs (ksu_cred / allow_shell / ksu_late_loaded / ksu_no_custom_rc) + types.h"
       fi
 
-      cd "$KERNEL_PLATFORM_FOLDER/KernelSU"
+      KSU_REPO_DIR="$KERNEL_PLATFORM_FOLDER/KernelSU"
+      KSU_COMMIT_SHA="$(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
+      echo "SukiSU checkout directory: $KSU_REPO_DIR"
+      echo "Actual SukiSU checkout SHA: $KSU_COMMIT_SHA"
+      if [[ "$KSU_INPUT" =~ ^[[:xdigit:]]{40}$ ]] \
+        && [[ "${KSU_COMMIT_SHA,,}" != "${KSU_INPUT,,}" ]]; then
+        echo "::error::SukiSU checkout SHA mismatch: requested $KSU_INPUT, checked out $KSU_COMMIT_SHA"
+        exit 1
+      fi
 
-      KSU_COMMIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+      cd "$KSU_REPO_DIR"
       COMMITS_COUNT="$(git rev-list --count HEAD 2>/dev/null || true)"
       if [[ ! "$COMMITS_COUNT" =~ ^[0-9]+$ ]]; then
         echo "::warning::Could not determine commit count, using fallback 30000."
@@ -894,7 +902,7 @@ runs:
         echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA"
         echo "KSUVER=$KSU_VERSION"
       } >> "$GITHUB_ENV"
-
+      
       cd ..
 
       DEFCONFIG="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
