@@ -876,6 +876,33 @@ runs:
         exit 1
       fi
 
+      KSU_KBUILD="$KSU_REPO_DIR/kernel/Kbuild"
+      if [ ! -f "$KSU_KBUILD" ]; then
+        echo "::error::SukiSU Kbuild file not found: $KSU_KBUILD"
+        exit 1
+      fi
+      python3 - "$KSU_KBUILD" <<'PY'
+      import pathlib
+      import sys
+
+      path = pathlib.Path(sys.argv[1])
+      lines = path.read_text().splitlines()
+      replacements = {
+          "REPO_BRANCH :=": "REPO_BRANCH := HEAD",
+          "KSU_GITHUB_VER   :=": "KSU_GITHUB_VER   :=",
+          "GITHUB_COMMITS   :=": "GITHUB_COMMITS   :=",
+      }
+      for prefix, replacement in replacements.items():
+          matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"Expected exactly one {prefix!r} assignment in {path}, found {len(matches)}"
+              )
+          lines[matches[0]] = replacement
+      path.write_text("\n".join(lines) + "\n")
+      PY
+      echo "Pinned Kbuild version metadata to checked-out HEAD (no live main/release API lookups)"
+
       cd "$KSU_REPO_DIR"
       COMMITS_COUNT="$(git rev-list --count HEAD 2>/dev/null || true)"
       if [[ ! "$COMMITS_COUNT" =~ ^[0-9]+$ ]]; then
@@ -902,7 +929,7 @@ runs:
         echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA"
         echo "KSUVER=$KSU_VERSION"
       } >> "$GITHUB_ENV"
-      
+
       cd ..
 
       DEFCONFIG="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
