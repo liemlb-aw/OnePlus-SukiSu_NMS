@@ -1373,10 +1373,14 @@ runs:
       cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
       CONFIG_SYSVIPC=y
       CONFIG_PID_NS=y
-      # CONFIG_USER_NS=y
-      # CONFIG_NETFILTER_XT_TARGET_REJECT=y
-      # CONFIG_NETFILTER_XT_TARGET_LOG=y
-      # CONFIG_NETFILTER_XT_MATCH_RECENT=y
+      CONFIG_USER_NS=y
+      CONFIG_NETFILTER_XT_TARGET_REJECT=y
+      CONFIG_NETFILTER_XT_TARGET_LOG=y
+      CONFIG_NETFILTER_XT_MATCH_RECENT=y
+      # Enable xattr, posix acl support on tmpfs
+      # For NixOS support
+      CONFIG_TMPFS_POSIX_ACL=y
+      CONFIG_TMPFS_XATTR=y
       # CONFIG_DEVTMPFS=y
       # CONFIG_POSIX_MQUEUE=y
       EOF

@@ -44,7 +44,7 @@ on:
         description: 'Enter SukiSU build json'
         required: true
         type: string
-        default: '[{"type":"SUKISU","hash":"95226411b36f6d3c2d224c090133ad79db65bfc8"}]'
+        default: '[{"type":"SUKISU","hash":"dfae923781350cb5113e0763a17e90cc4edd59b4"}]'
       optimize_level:
         description: "Compiler optimization level"
         required: true
