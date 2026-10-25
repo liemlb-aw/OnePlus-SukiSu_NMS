@@ -1464,8 +1464,10 @@ runs:
       # For NixOS support
       CONFIG_TMPFS_POSIX_ACL=y
       CONFIG_TMPFS_XATTR=y
+      
+      # PI breaking
+      CONFIG_POSIX_MQUEUE=y
       # CONFIG_DEVTMPFS=y
-      # CONFIG_POSIX_MQUEUE=y
       EOF
 
       if [ "${{ env.OP_RUST_BUILD }}" = "true" ]; then
