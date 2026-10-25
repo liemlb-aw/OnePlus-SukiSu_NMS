@@ -2,11 +2,12 @@
 <manifest>
   <remote fetch="https://git.codelinaro.org/clo/la" name="clo-la"/>
   <remote fetch="https://github.com/OnePlusOSS" name="origin"/>
+  <remote fetch="https://github.com/liemlb-aw" name="rm11"/>
   <remote fetch="https://github.com/Bouteillepleine" name="Bouteillepleine"/>
   <default remote="clo-la" revision="dummy_revision" sync-c="true" sync-tags="false"/>
   <project remote="Bouteillepleine" name="AnyKernel3" path="AnyKernel3" revision="suite"/>
   
-  <project remote="origin" name="android_kernel_common_oneplus_sm8850" path="kernel_platform/common" revision="oneplus/sm8850_b_16.0.0_oneplus_15" clone-depth="1">
+  <project remote="rm11" name="android_kernel_common_oneplus_sm8850" path="kernel_platform/common" revision="nx809j-camfix" clone-depth="1">
     <linkfile dest="kernel_platform/.source_date_epoch_dir" src="."/>
   </project>
   

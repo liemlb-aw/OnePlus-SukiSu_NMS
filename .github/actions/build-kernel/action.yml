@@ -398,6 +398,17 @@ runs:
       DEBUG_ZIP_NAME="debug_${OP_MODEL}_${OP_OS_VERSION}.zip"
       echo "DEBUG_ZIP_NAME=$DEBUG_ZIP_NAME" >> "$GITHUB_ENV"
 
+  - name: Apply NX809J camera pinctrl fix
+    shell: bash
+    run: |
+      set -euo pipefail
+      base="https://raw.githubusercontent.com/liemlb-aw/android_kernel_common_oneplus_sm8850/nx809j-camfix"
+      curl -fsSL "$base/drivers/pinctrl/pinmux.c" -o "$COMMON_KERNEL_FOLDER/drivers/pinctrl/pinmux.c"
+      curl -fsSL "$base/drivers/gpio/gpiolib.c"   -o "$COMMON_KERNEL_FOLDER/drivers/gpio/gpiolib.c"
+      grep -q "sharing for" "$COMMON_KERNEL_FOLDER/drivers/pinctrl/pinmux.c" || { echo "pinmux FAILED"; exit 1; }
+      grep -q "strncmp(label, .CAM., 3)" "$COMMON_KERNEL_FOLDER/drivers/gpio/gpiolib.c" || { echo "gpiolib FAILED"; exit 1; }
+      echo "NX809J camera fixes (pinmux+gpiolib) applied"
+
   - name: Set Kernel build-tools to Path
     shell: bash
     run: |
