@@ -1,8 +1,8 @@
 {
-  "model": "0_R11",
+  "model": "0R11",
   "soc": "canoe",
   "branch": "wild/sm8850",
-  "manifest": "0_rm11p_w.xml",
+  "manifest": "0rm11p_w.xml",
   "android_version": "android16",
   "kernel_version": "6.12",
   "os_version": "A16",
