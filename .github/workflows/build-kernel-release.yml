@@ -78,7 +78,7 @@ on:
         description: 'simonpunk/susfs4ksu ref to patch SUSFS into every kernel. auto = the gki branch matching each device, a branch/tag/40-char SHA pins it (a release you want to reproduce should pass a SHA), empty = build without SUSFS.'
         required: false
         type: string
-        default: auto
+        default: ''
       nomount_ref:
         description: 'NoMount-Suite branch/ref for the Prism engine src + patches (default main; set a branch to validate it before it is released). The engine ships inside the Suite repo, under hookless/.'
         required: false

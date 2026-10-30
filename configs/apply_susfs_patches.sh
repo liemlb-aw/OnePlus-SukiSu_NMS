@@ -489,12 +489,19 @@ SELINUXEOF
   perl -0pi -e 's/^[ \t]*static[ \t]+(const[ \t]+)?struct[ \t]+selinux_state[ \t]+fake_state([ \t]*[=;])/${1}struct selinux_state fake_state$2/mg' "$target" || true
   perl -0pi -e 's/^[ \t]*static[ \t]+(const[ \t]+)?struct[ \t]+selinux_state[ \t]+\*fake_state([ \t]*[=;])/${1}struct selinux_state *fake_state$2/mg' "$target" || true
 
+  # backup_sepolicy is DEFINED in kernel/selinux/rules.c and assigned there by
+  # ksu_dup_sepolicy(); selinux_hide.c only uses it, taking the declaration from
+  # kernel/include/ksu.h. That header is not included here, so a `static`
+  # definition compiles without a redeclaration error and silently shadows the
+  # real global: it stays NULL, ksu_selinux_hide_enable() returns -EAGAIN,
+  # ksu_selinux_hide_running never becomes true, and the whole cloak is inert
+  # while the manager reports it enabled. Declare, do not define.
   if grep -q "backup_sepolicy" "$target" && ! grep -q "struct selinux_policy \*backup_sepolicy" "$target"; then
 awk '
   /^#include/ { print; last_include = NR; next }
   last_include && !inserted {
     print ""
-    print "static struct selinux_policy *backup_sepolicy;"
+    print "extern struct selinux_policy *backup_sepolicy;"
     print ""
     inserted = 1
   }
@@ -502,7 +509,7 @@ awk '
   END {
     if (!inserted) {
       print ""
-      print "static struct selinux_policy *backup_sepolicy;"
+      print "extern struct selinux_policy *backup_sepolicy;"
     }
   }
 ' "$target" > "$target.tmp"
@@ -514,16 +521,21 @@ mv "$target.tmp" "$target"
 -e 's/\bksu_late_loaded\b/0/g' \
 "$target" || true
 
-  perl -0pi -e 's/if[ \t]*\([ \t]*security_dump_masked_av_fn[ \t]*\)/if (\&security_dump_masked_av_fn)/g' "$target" || true
-  perl -0pi -e 's/if[ \t]*\([ \t]*context_struct_compute_av_fn[ \t]*\)/if (\&context_struct_compute_av_fn)/g' "$target" || true
+  # Both symbols are function POINTERS filled in by find_kernel_symbol_exact(), so
+  # `if (fn)` is the correct "did kallsyms resolve it?" check and warns about nothing.
+  # Rewriting it to `if (&fn)` took the address of the pointer variable instead: the
+  # test is then always true, so a failed lookup calls through NULL rather than taking
+  # the fallback, and clang reports the tautology as -Wpointer-bool-conversion -- the
+  # very warning the rewrite was meant to remove. Assert the broken form is absent.
+  perl -0pi -e 's/if[ \t]*\([ \t]*&[ \t]*(security_dump_masked_av_fn|context_struct_compute_av_fn)[ \t]*\)/if ($1)/g' "$target" || true
 
   if grep -n 'ksu_late_loaded' "$target"; then
 echo "::error::ksu_late_loaded still remains in $target"
 exit 1
   fi
 
-  if grep -nE 'if[[:space:]]*\([[:space:]]*(security_dump_masked_av_fn|context_struct_compute_av_fn)[[:space:]]*\)' "$target"; then
-echo "::error::Pointer-bool warning patterns still remain in $target"
+  if grep -nE 'if[[:space:]]*\([[:space:]]*&[[:space:]]*(security_dump_masked_av_fn|context_struct_compute_av_fn)[[:space:]]*\)' "$target"; then
+echo "::error::address-of null check (always true) remains in $target"
 exit 1
   fi
 
@@ -2089,8 +2101,8 @@ echo "::error::Unused new_fn still exists in drivers/kernelsu/feature/selinux_hi
 exit 1
   fi
 
-  if grep -nE 'if[[:space:]]*\([[:space:]]*(security_dump_masked_av_fn|context_struct_compute_av_fn)[[:space:]]*\)' drivers/kernelsu/feature/selinux_hide.c; then
-echo "::error::Pointer-bool warning patterns still remain in drivers/kernelsu/feature/selinux_hide.c"
+  if grep -nE 'if[[:space:]]*\([[:space:]]*&[[:space:]]*(security_dump_masked_av_fn|context_struct_compute_av_fn)[[:space:]]*\)' drivers/kernelsu/feature/selinux_hide.c; then
+echo "::error::address-of null check (always true) remains in drivers/kernelsu/feature/selinux_hide.c"
 exit 1
   fi
 fi

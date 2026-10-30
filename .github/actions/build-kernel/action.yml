@@ -46,7 +46,7 @@ inputs:
     description: 'simonpunk/susfs4ksu ref to patch SUSFS into the kernel from. auto = the gki-<android>-<kernel> branch of each device, a branch/tag/40-char SHA pins it, empty = build without SUSFS. It goes in after the NoMount stack; hunks that no longer fit are re-anchored by .github/scripts/susfs_patch_surgery.py and the NoMount verifier runs again afterwards.'
     required: false
     type: string
-    default: auto
+    default: ''
   nomount_ref:
     description: 'NoMount-Suite branch/ref to source the Prism engine src + patches from (default main; set a branch to validate it before it is released). The engine ships inside the Suite repo, under hookless/.'
     required: false
