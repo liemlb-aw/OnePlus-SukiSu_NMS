@@ -1529,6 +1529,7 @@ runs:
         echo "Applying patch to enable SYSVIPC without breaking ABI"
         case "$OP_BRANCH" in
           wild/sm8850|wild/sm8845)
+            echo "patch with $KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_a16-6.12.patch"
             patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_a16-6.12.patch"
             ;;
           wild/sm8550|wild/sm7550)
@@ -1563,7 +1564,7 @@ runs:
         CONFIG_TMPFS_XATTR=y
         
         # PI breaking
-        # CONFIG_POSIX_MQUEUE=y
+        CONFIG_POSIX_MQUEUE=y
         # CONFIG_DEVTMPFS=y
         EOF
         
