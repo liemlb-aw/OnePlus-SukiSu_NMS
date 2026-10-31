@@ -5,3 +5,8 @@
 *.Identifier
 *.orig
 *.rej
+/bouton_kernel_patches
+/nomount_hookless
+/susfs4ksu-lkm
+.ccache
+OP15
