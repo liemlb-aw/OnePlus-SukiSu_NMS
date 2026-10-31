@@ -839,6 +839,14 @@ runs:
           on)  want=true ;;
           *)   want="${OP_STOCK_CONFIG:-false}" ;;
         esac
+        # Droidspaces turns on SYSVIPC, DEVTMPFS, PID_NS and POSIX_MQUEUE, every one of
+        # which stock leaves unset. A ds build that reports its real config hands any
+        # app a four-symbol diff against the device it claims to be, so the two travel
+        # together: ds on means the spoof is on, whatever the input asked for.
+        if [ "${OP_DS:-false}" = "true" ] && [ "$want" != "true" ]; then
+          echo "::notice title=config.gz spoof::forced on because Droidspaces is enabled for $OP_MODEL"
+          want=true
+        fi
         echo "STOCK_CONFIG_WANT=$want" >> "$GITHUB_ENV"
         if [ "$want" != "true" ]; then
           echo "config.gz spoof off for $OP_MODEL — not snapshotting"
@@ -879,9 +887,23 @@ runs:
         echo "STOCK_SNAPSHOT=$SNAP" >> "$GITHUB_ENV"
         # A copy for auditing, uploaded with the debug artifacts when debug is on.
         cp "$SNAP" "$DEBUG_ARTIFACTS_FOLDER/stock_config_${OP_MODEL}.config" 2>/dev/null || true
+        # And one on its own, so a spoof_config_gz=on sweep can collect every model's
+        # stock config without turning on debug and dragging vmlinux along with it.
+        mkdir -p "$GITHUB_WORKSPACE/stock_config_snapshot"
+        cp "$SNAP" "$GITHUB_WORKSPACE/stock_config_snapshot/stock_config_${OP_MODEL}.config"
         echo "✅ snapshot: $(wc -l < "$SNAP") lines, sha256 $(sha256sum "$SNAP" | cut -c1-16)"
         echo "   $(sed -n 3p "$SNAP")"
         echo "::endgroup::"
+
+    - name: Upload the stock config snapshot
+      if: ${{ env.STOCK_SNAPSHOT != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: stock-config-${{ env.OP_MODEL }}
+        path: ${{ github.workspace }}/stock_config_snapshot/stock_config_${{ env.OP_MODEL }}.config
+        if-no-files-found: ignore
+        retention-days: 7
+        compression-level: 9
 
     - name: Clean Up ABI Protected Exports
       shell: bash
@@ -1672,22 +1694,55 @@ runs:
         # naming a different clang contradicts the banner with nothing but a local
         # read. Align that one key; LOCALVERSION stays stock, which is consistent
         # because uname -r is already spoofed to the stock string.
+        # CC_VERSION_TEXT alone is not enough: CLANG_VERSION, LLD_VERSION and
+        # AS_VERSION encode the same toolchain as major*10000+minor*100+patch, so a
+        # capture realigned on one key reads 'clang version 20.0.0' beside
+        # CONFIG_CLANG_VERSION=190001 and contradicts itself without any outside
+        # reference. Align the whole family, and only keys the config already has.
         if grep -q '^CONFIG_CC_VERSION_TEXT=' "$STOCK"; then
           cc_text="$(clang --version 2>/dev/null | head -n 1 || true)"
+          lld_text="$(ld.lld --version 2>/dev/null | head -n 1 || true)"
+          rustc_text="$(rustc --version 2>/dev/null | head -n 1 || true)"
           if [ -n "$cc_text" ]; then
-            CC_TEXT="$cc_text" python3 - "$STOCK" <<'PY' || echo "::warning title=config.gz spoof::could not align CONFIG_CC_VERSION_TEXT"
-        import os, sys
-        path, cc = sys.argv[1], os.environ["CC_TEXT"]
-        with open(path) as f:
-            lines = f.readlines()
-        with open(path, "w") as f:
-            for line in lines:
-                if line.startswith("CONFIG_CC_VERSION_TEXT="):
-                    line = 'CONFIG_CC_VERSION_TEXT="%s"\n' % cc
-                f.write(line)
+            CC_TEXT="$cc_text" LLD_TEXT="$lld_text" RUSTC_TEXT="$rustc_text" \
+            python3 - "$STOCK" <<'PY' || echo "::warning title=config.gz spoof::could not align the toolchain keys"
+        import os, re, sys
+
+        path = sys.argv[1]
+        cc = os.environ["CC_TEXT"]
+        lld = os.environ.get("LLD_TEXT", "")
+        rustc = os.environ.get("RUSTC_TEXT", "")
+
+        def code(text):
+            m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+            if not m:
+                return None
+            major, minor, patch = (int(x) for x in m.groups())
+            return major * 10000 + minor * 100 + patch
+
+        subs = {"CONFIG_CC_VERSION_TEXT": '"%s"' % cc}
+        cc_code = code(cc)
+        if cc_code is not None:
+            subs["CONFIG_CLANG_VERSION"] = str(cc_code)
+            subs["CONFIG_AS_VERSION"] = str(cc_code)
+        lld_code = code(lld)
+        if lld_code is not None:
+            subs["CONFIG_LLD_VERSION"] = str(lld_code)
+        if rustc:
+            subs["CONFIG_RUSTC_VERSION_TEXT"] = '"%s"' % rustc
+
+        out, hit = [], []
+        for line in open(path):
+            key = line.split("=", 1)[0]
+            if key in subs:
+                line = "%s=%s\n" % (key, subs[key])
+                hit.append(key)
+            out.append(line)
+        open(path, "w").writelines(out)
+        print("   toolchain aligned: %s" % ", ".join(sorted(hit)))
         PY
           else
-            echo "::warning title=config.gz spoof::clang not resolvable here; CONFIG_CC_VERSION_TEXT left at its stock value"
+            echo "::warning title=config.gz spoof::clang not resolvable here; the toolchain keys stay at their stock values"
           fi
         fi
 
