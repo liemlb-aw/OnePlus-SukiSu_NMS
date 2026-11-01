@@ -64,7 +64,7 @@ on:
       clean_build:
         description: 'Clean build (no ccache)'
         type: boolean
-        default: true
+        default: false
       debug:
         description: 'Enable debug mode: dumping debug related artifacts and show some debug logs'
         required: false

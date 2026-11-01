@@ -157,7 +157,7 @@ if grep -q '#ifndef KSU_NO_PREINIT' fs/exec.c && ! grep -q '^#define KSU_NO_PREI
 fi
 
 SH="$KSU_FOLDER/kernel/feature/selinux_hide.c"
-python3 -I "$SCRIPTS_DIR/susfs_sukisu_selinux_hide.py" "$SH"
+python3 -I "$SCRIPTS_DIR/susfs_sukisu_selinux_hide.py" "$SH" "$COMMON_KERNEL_FOLDER"
 if grep -q '^int my_setprocattr(const char \*name, void \*value, size_t size)$' "$SH" && ! grep -q '__nocfi .*setprocattr' "$SH"; then
   sed -i 's/^int my_setprocattr(const char \*name, void \*value, size_t size)$/int __nocfi my_setprocattr(const char *name, void *value, size_t size)/' "$SH"
   echo "restored __nocfi on my_setprocattr() after the SUSFS enable patch rewrote its signature"

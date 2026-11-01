@@ -542,6 +542,54 @@ exit 1
   echo "✅ Fixed $target"
 }
 
+reconcile_sukisu_rules_reject() {
+  local target="$1"
+  local reject="$target.rej"
+  [ -f "$reject" ] || return 0
+
+  if ! awk '
+    /^(---|\+\+\+|@@)/ { next }
+    /^[+-]/ {
+      line = substr($0, 2)
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      if (line == "" ||
+          line == "static void reset_avc_cache(u32 seqno)" ||
+          line == "static void reset_avc_cache()" ||
+          line == "avc_ss_reset(seqno);" || line == "avc_ss_reset(0);" ||
+          line == "avc_ss_reset(avc, seqno);" || line == "avc_ss_reset(avc, 0);" ||
+          line == "selnl_notify_policyload(seqno);" || line == "selnl_notify_policyload(0);" ||
+          line == "selinux_status_update_policyload(seqno);" ||
+          line == "selinux_status_update_policyload(0);" ||
+          line == "selinux_status_update_policyload(&selinux_state, seqno);" ||
+          line == "selinux_status_update_policyload(&selinux_state, 0);" ||
+          line == "pol->latest_granting = old_pol->latest_granting + 1;" ||
+          line == "reset_avc_cache(pol->latest_granting);" ||
+          line == "reset_avc_cache();" || line == "susfs_set_batch_sid();") next
+      print FNR ":" $0
+      bad = 1
+    }
+    END { exit bad ? 1 : 0 }
+  ' "$reject"; then
+echo "::error::Unrecognised SELinux rules reject; refusing to discard $reject"
+return 1
+  fi
+
+  perl -0pi -e 's{(void apply_kernelsu_rules\(\)\s*\{.*?)(\n[ \t]*reset_avc_cache\([^;]*\);)(.*?\n\})}{my ($body, $reset, $tail) = ($1, $2, $3); $body . $reset . (($body . $tail) =~ /susfs_set_batch_sid\s*\(/ ? "" : "\n    susfs_set_batch_sid();") . $tail}se' "$target"
+
+  if ! awk '/^void apply_kernelsu_rules\(/,/^}/' "$target" | grep 'susfs_set_batch_sid[[:space:]]*();' >/dev/null; then
+echo "::error::SUSFS SID initialization was not restored in $target"
+return 1
+  fi
+  if [ "${OP_NMS:-false}" = true ] && grep -q 'selinux_status_update_policyload' "$target"; then
+echo "::error::NoMount SELinux status preservation was lost in $target"
+return 1
+  fi
+
+  rm -f "$reject"
+  echo "Reconciled SUSFS rules reject; retained policy sequence handling and restored batch SIDs"
+}
+
 fix_sukisu_setuid_seccomp() {
   local target="$1"
   [ -f "$target" ] || return 0
@@ -1517,6 +1565,8 @@ cd "$KSU_FOLDER"
 normalize_sukisu_to_official_baseline "$KSU_FOLDER/kernel"
 
 patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+
+reconcile_sukisu_rules_reject "kernel/selinux/rules.c"
 
 EXPECTED_SUKISU_REJECTS=(
   "kernel/core/init.c.rej"
