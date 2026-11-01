@@ -1564,7 +1564,7 @@ runs:
         CONFIG_TMPFS_XATTR=y
         
         # PI breaking
-        CONFIG_POSIX_MQUEUE=y
+        # CONFIG_POSIX_MQUEUE=y
         # CONFIG_DEVTMPFS=y
         EOF
         
