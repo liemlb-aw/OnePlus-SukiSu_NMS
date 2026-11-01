@@ -542,6 +542,18 @@ exit 1
   echo "✅ Fixed $target"
 }
 
+fix_sukisu_setuid_seccomp() {
+  local target="$1"
+  [ -f "$target" ] || return 0
+
+  perl -0pi -e 's{^[ \t]*//[^\n]*Disable seccomp[^\n]*\n}{}mg; s{^([ \t]*)disable_seccomp[ \t]*\(\);[ \t]*$}{$1if (current->seccomp.mode == SECCOMP_MODE_FILTER && current->seccomp.filter) {\n$1    spin_lock_irq(&current->sighand->siglock);\n$1    ksu_seccomp_allow_cache(current->seccomp.filter, __NR_reboot);\n$1    spin_unlock_irq(&current->sighand->siglock);\n$1}}mg; s{^extern void disable_seccomp\(void\);\n}{}mg' "$target"
+
+  if grep -nE '\bdisable_seccomp[[:space:]]*\(' "$target"; then
+echo "::error::setuid hook must preserve app seccomp filters: $target"
+exit 1
+  fi
+}
+
 fix_sukisu_app_profile_c() {
   local target="$1"
   [ -f "$target" ] || return 0
@@ -1619,6 +1631,7 @@ fix_sukisu_boot_event_c         "kernel/runtime/boot_event.c"
 fix_sukisu_ksud_integration_c   "kernel/runtime/ksud_integration.c"
 fix_sukisu_selinux_hide_c       "kernel/feature/selinux_hide.c"
 fix_sukisu_app_profile_c        "kernel/policy/app_profile.c"
+fix_sukisu_setuid_seccomp       "kernel/hook/setuid_hook.c"
 fix_sukisu_dispatch_c           "kernel/supercall/dispatch.c"
 fix_sukisu_sucompat_api         "kernel"
 fix_sukisu_forced_execveat_link_symbols "kernel"
@@ -1647,6 +1660,7 @@ drivers/kernelsu/hook/lsm_hook.c || true
 fi
 
 sed -i 's/is_zygote_normal_app_uid(new_uid)/is_appuid(new_uid)/' drivers/kernelsu/hook/setuid_hook.c 2>/dev/null || true
+fix_sukisu_setuid_seccomp drivers/kernelsu/hook/setuid_hook.c
 # Only stub out ksu_handle_extra_susfs_work() when susfs_extra_works is NOT provided by the
 # SUSFS source (SUSFS v2.1.0). On v2.2.0 the symbol exists in fs/susfs.c and drives the
 # deferred umount/hide work, so it MUST stay enabled.
